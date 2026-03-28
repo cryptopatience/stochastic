@@ -128,27 +128,100 @@ def detect_signals(df: pd.DataFrame, ob: float, os_: float) -> pd.DataFrame:
     return df
 
 
-def run_backtest(df: pd.DataFrame, hold_days: int) -> pd.DataFrame:
+def run_backtest(
+    df: pd.DataFrame,
+    hold_days: int,
+    total_capital: float,
+    risk_per_trade: float,
+    stop_loss_pct: float,
+    partial_exit_pct: float,
+    target_profit_pct: float,
+) -> pd.DataFrame:
     trades = []
     close  = df["Close"].values
+    high   = df["High"].values
+    low    = df["Low"].values
     dates  = df.index
     idx    = df.index.get_indexer(df[df["second_buy"]].index)
+
+    remaining_capital = total_capital
 
     for ei in idx:
         if ei < 0:
             continue
-        xi = min(ei + hold_days, len(close) - 1)
-        bp = float(close[ei + 1]) if ei + 1 < len(close) else float(close[ei])
-        sp = float(close[xi])
-        ret = (sp - bp) / bp * 100
+
+        buy_i       = ei + 1 if ei + 1 < len(close) else ei
+        entry_price = float(close[buy_i])
+        stop_price  = entry_price * (1 - stop_loss_pct / 100)
+        target_price = entry_price * (1 + target_profit_pct / 100)
+
+        # ── 포지션 사이즈 (리스크 기반) ──────────────────────────────
+        risk_amount    = remaining_capital * (risk_per_trade / 100)
+        risk_per_share = entry_price - stop_price
+        shares         = risk_amount / risk_per_share if risk_per_share > 0 else 0
+        position_value = shares * entry_price
+        if position_value > remaining_capital:
+            shares         = remaining_capital / entry_price
+            position_value = remaining_capital
+        shares = int(shares)
+        if shares == 0:
+            continue
+
+        partial_shares = int(shares * partial_exit_pct / 100)
+        remain_shares  = shares - partial_shares
+
+        # ── 보유 기간 중 가격 경로 확인 ──────────────────────────────
+        exit_idx     = min(buy_i + hold_days, len(close) - 1)
+        hit_stop     = False
+        hit_target   = False
+        stop_exit_i  = exit_idx
+        target_exit_i = exit_idx
+
+        for j in range(buy_i + 1, exit_idx + 1):
+            if not hit_stop and float(low[j]) <= stop_price:
+                hit_stop    = True
+                stop_exit_i = j
+            if not hit_target and float(high[j]) >= target_price:
+                hit_target    = True
+                target_exit_i = j
+
+        # ── 청산 결정 ────────────────────────────────────────────────
+        if hit_stop and (not hit_target or stop_exit_i <= target_exit_i):
+            exit_price_final = stop_price
+            pnl              = (exit_price_final - entry_price) * shares
+            result_label     = "🛑 손절"
+            final_exit_i     = stop_exit_i
+        elif hit_target and partial_exit_pct < 100:
+            pnl_partial      = (target_price - entry_price) * partial_shares
+            exit_price_full  = float(close[exit_idx])
+            pnl_remain       = (exit_price_full - entry_price) * remain_shares
+            pnl              = pnl_partial + pnl_remain
+            exit_price_final = target_price
+            result_label     = "🎯 목표 달성"
+            final_exit_i     = exit_idx
+        else:
+            exit_price_final = float(close[exit_idx])
+            pnl              = (exit_price_final - entry_price) * shares
+            result_label     = "✅ 수익" if pnl > 0 else "❌ 손실"
+            final_exit_i     = exit_idx
+
+        ret_pct = (exit_price_final - entry_price) / entry_price * 100
+
         trades.append({
-            "매수일": dates[ei].strftime("%Y-%m-%d"),
-            "매도일": dates[xi].strftime("%Y-%m-%d"),
-            "매수가": round(bp, 2),
-            "매도가": round(sp, 2),
-            "수익률(%)": round(ret, 2),
-            "결과": "✅ 수익" if ret > 0 else "❌ 손실",
+            "매수일":          dates[ei].strftime("%Y-%m-%d"),
+            "매도일":          dates[final_exit_i].strftime("%Y-%m-%d"),
+            "매수가":          round(entry_price, 2),
+            "손절가":          round(stop_price, 2),
+            "1차목표가":       round(target_price, 2),
+            "매도가":          round(exit_price_final, 2),
+            "주식 수":         shares,
+            "투자금 ($)":      round(position_value, 0),
+            "리스크 금액 ($)": round(risk_amount, 0),
+            "손익 ($)":        round(pnl, 0),
+            "수익률(%)":       round(ret_pct, 2),
+            "결과":            result_label,
         })
+
     return pd.DataFrame(trades)
 
 
@@ -519,6 +592,32 @@ with st.sidebar:
                           help="두 번째 매수 신호 발생 후 보유할 거래일 수")
 
     st.markdown("---")
+    st.markdown("#### 💰 자금 관리 (Position Sizing)")
+    total_capital = st.number_input(
+        "총 투자 가능 자본 (USD)",
+        min_value=1000, max_value=10_000_000, value=10000, step=1000,
+    )
+    risk_per_trade = st.slider(
+        "트레이드당 리스크 (%)",
+        min_value=0.5, max_value=5.0, value=1.0, step=0.5,
+        help="총 자본 대비 한 번 손절 시 허용 손실 비율",
+    )
+    stop_loss = st.slider(
+        "손절 기준 (%)",
+        min_value=1.0, max_value=15.0, value=5.0, step=0.5,
+        help="매수가 대비 손절가 하락폭",
+    )
+    target_profit_pct = st.slider(
+        "1차 목표 수익률 (%)",
+        min_value=3, max_value=30, value=10, step=1,
+    )
+    partial_exit_pct = st.slider(
+        "1차 목표 달성 시 청산 비율 (%)",
+        min_value=25, max_value=100, value=50, step=25,
+        help="목표 수익률 달성 시 먼저 매도할 비율",
+    )
+
+    st.markdown("---")
     st.markdown("#### ⏱️ 타임프레임 비교")
     compare_mode = st.checkbox("일봉 vs 주봉 비교 모드", value=False)
 
@@ -562,13 +661,16 @@ st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
 # 실행 로직
 # ─────────────────────────────────────────────────────────────────────────────
-def load_and_process(ticker, start_date, end_date, interval, k_period, k_smooth, d_smooth, overbought, oversold, hold_days):
+def load_and_process(ticker, start_date, end_date, interval, k_period, k_smooth, d_smooth,
+                     overbought, oversold, hold_days,
+                     total_capital, risk_per_trade, stop_loss_pct, partial_exit_pct, target_profit_pct):
     df_raw = download_data(ticker, str(start_date), str(end_date), interval)
     if df_raw.empty:
         return None, None
     df = calc_sso(df_raw, k_period, k_smooth, d_smooth)
     df = detect_signals(df, overbought, oversold)
-    trades = run_backtest(df, hold_days)
+    trades = run_backtest(df, hold_days, total_capital, risk_per_trade,
+                          stop_loss_pct, partial_exit_pct, target_profit_pct)
     return df, trades
 
 
@@ -577,7 +679,8 @@ if run_btn or "df" not in st.session_state:
         try:
             df, trades = load_and_process(
                 ticker, start_date, end_date, "1d",
-                k_period, k_smooth, d_smooth, overbought, oversold, hold_days
+                k_period, k_smooth, d_smooth, overbought, oversold, hold_days,
+                total_capital, risk_per_trade, stop_loss, partial_exit_pct, target_profit_pct,
             )
             if df is None:
                 st.error("❌ 데이터를 불러올 수 없습니다. 티커를 확인해 주세요.")
@@ -590,7 +693,8 @@ if run_btn or "df" not in st.session_state:
             if compare_mode:
                 df_wk, trades_wk = load_and_process(
                     ticker, start_date, end_date, "1wk",
-                    k_period, k_smooth, d_smooth, overbought, oversold, hold_days
+                    k_period, k_smooth, d_smooth, overbought, oversold, hold_days,
+                    total_capital, risk_per_trade, stop_loss, partial_exit_pct, target_profit_pct,
                 )
                 st.session_state["df_wk"]     = df_wk
                 st.session_state["trades_wk"] = trades_wk
